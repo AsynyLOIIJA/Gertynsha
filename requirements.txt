@@ -1,0 +1,8 @@
+telethon==1.32.0
+flask
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+requests
+beautifulsoup4
