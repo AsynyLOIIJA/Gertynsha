@@ -1,9 +1,8 @@
-# main.pyукф
+# main.py
 import os
 import json
 import asyncio
 import logging
-from pathlib import Path  # может использоваться для генерации имён, но папки больше не создаём
 from threading import Thread
 
 from telethon import TelegramClient, events
@@ -11,9 +10,9 @@ from telethon.errors import FloodWaitError, RPCError
 from flask import Flask
 
 # Google API
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaInMemoryUpload
+from google.oauth2.credentials import Credentials
 
 # -----------------------------
 # Flask keep-alive
@@ -39,14 +38,13 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")  # если используем бота
 TARGET = os.environ.get("TARGET", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "live_session")
-SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON", "")
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")  # OAuth token.json
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 
 if not API_ID or not API_HASH or not TARGET:
     raise ValueError("API_ID, API_HASH and TARGET must be set in environment variables.")
-
-if not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
-    raise ValueError("SERVICE_ACCOUNT_JSON and DRIVE_FOLDER_ID must be set in environment variables.")
+if not TOKEN_FILE or not DRIVE_FOLDER_ID:
+    raise ValueError("TOKEN_FILE and DRIVE_FOLDER_ID must be set in environment variables.")
 
 # -----------------------------
 # Logging
@@ -59,32 +57,27 @@ logging.basicConfig(
 logger = logging.getLogger("tg-listener")
 
 # -----------------------------
-# Больше не сохраняем локально: ни директорий, ни лог-файла.
-# Все сообщения и медиа будут сразу уходить в Google Drive.
-# -----------------------------
-
-# -----------------------------
 # Telethon client
 # -----------------------------
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 # -----------------------------
-# Google Drive client
+# Google Drive client (OAuth)
 # -----------------------------
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-def create_drive_service_from_sa(sa_json_str: str):
-    sa_info = json.loads(sa_json_str)
-    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return drive_service
+def create_drive_service_from_token(token_file=TOKEN_FILE):
+    creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return service
 
-drive_service = create_drive_service_from_sa(SERVICE_ACCOUNT_JSON)
+drive_service = create_drive_service_from_token(TOKEN_FILE)
 
+# -----------------------------
+# Google Drive upload helpers
+# -----------------------------
 def upload_bytes_to_drive(data: bytes, filename: str, folder_id: str):
-    """Загрузка бинарных данных напрямую в Google Drive."""
     try:
-        from googleapiclient.http import MediaInMemoryUpload
         media = MediaInMemoryUpload(data, mimetype="application/octet-stream", resumable=True)
         file_metadata = {"name": filename, "parents": [folder_id]}
         file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
@@ -96,11 +89,8 @@ def upload_bytes_to_drive(data: bytes, filename: str, folder_id: str):
         return None
 
 def upload_message_json(message_dict: dict, folder_id: str):
-    """Загрузить JSON представление сообщения (текст и метаданные) в Google Drive."""
     try:
-        from googleapiclient.http import MediaInMemoryUpload
         json_bytes = json.dumps(message_dict, ensure_ascii=False, indent=2).encode("utf-8")
-        # Формируем имя файла: msg_<id>_<timestamp>.json (заменяем двоеточия)
         ts = message_dict.get('ts', '').replace(':', '-')
         filename = f"msg_{message_dict.get('id')}_{ts}.json"
         media = MediaInMemoryUpload(json_bytes, mimetype="application/json", resumable=True)
@@ -132,10 +122,9 @@ def build_message_dict(msg, meta: str, text: str, media_entries: list):
     }
 
 async def fetch_media_bytes(message, retries: int = 3):
-    """Получить медиа как bytes. Использует download_media(file=bytes)."""
     for attempt in range(1, retries + 1):
         try:
-            data = await message.download_media(file=bytes)  # Telethon вернёт bytes
+            data = await message.download_media(file=bytes)
             return data if data else None
         except FloodWaitError as e:
             wait = getattr(e, "seconds", 10)
@@ -165,6 +154,7 @@ async def handler(event):
         logger.info("New message from target: %s", meta)
         text = msg.message or msg.raw_text or ""
         media_entries = []
+
         if msg.media:
             media_bytes = await fetch_media_bytes(msg)
             if media_bytes:
