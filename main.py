@@ -3,7 +3,7 @@ import os
 import json
 import asyncio
 import logging
-from pathlib import Path
+from pathlib import Path  # может использоваться для генерации имён, но папки больше не создаём
 from threading import Thread
 
 from telethon import TelegramClient, events
@@ -59,13 +59,9 @@ logging.basicConfig(
 logger = logging.getLogger("tg-listener")
 
 # -----------------------------
-# Paths
+# Больше не сохраняем локально: ни директорий, ни лог-файла.
+# Все сообщения и медиа будут сразу уходить в Google Drive.
 # -----------------------------
-BASE_DIR = Path("live_dump") / str(TARGET)
-MEDIA_DIR = BASE_DIR / "media"
-LOG_FILE = BASE_DIR / "live_messages.txt"
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
 # Telethon client
@@ -85,16 +81,36 @@ def create_drive_service_from_sa(sa_json_str: str):
 
 drive_service = create_drive_service_from_sa(SERVICE_ACCOUNT_JSON)
 
-def upload_file_to_drive(local_path: Path, folder_id: str):
+def upload_bytes_to_drive(data: bytes, filename: str, folder_id: str):
+    """Загрузка бинарных данных напрямую в Google Drive."""
     try:
-        file_metadata = {"name": local_path.name, "parents": [folder_id]}
-        media = MediaFileUpload(str(local_path), resumable=True)
+        from googleapiclient.http import MediaInMemoryUpload
+        media = MediaInMemoryUpload(data, mimetype="application/octet-stream", resumable=True)
+        file_metadata = {"name": filename, "parents": [folder_id]}
         file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
         file_id = file.get("id")
-        logger.info("Uploaded to Drive: %s (id=%s)", local_path.name, file_id)
+        logger.info("Uploaded bytes to Drive: %s (id=%s)", filename, file_id)
         return file_id
     except Exception as e:
-        logger.exception("Drive upload failed for %s: %s", local_path, e)
+        logger.exception("Drive upload bytes failed for %s: %s", filename, e)
+        return None
+
+def upload_message_json(message_dict: dict, folder_id: str):
+    """Загрузить JSON представление сообщения (текст и метаданные) в Google Drive."""
+    try:
+        from googleapiclient.http import MediaInMemoryUpload
+        json_bytes = json.dumps(message_dict, ensure_ascii=False, indent=2).encode("utf-8")
+        # Формируем имя файла: msg_<id>_<timestamp>.json (заменяем двоеточия)
+        ts = message_dict.get('ts', '').replace(':', '-')
+        filename = f"msg_{message_dict.get('id')}_{ts}.json"
+        media = MediaInMemoryUpload(json_bytes, mimetype="application/json", resumable=True)
+        file_metadata = {"name": filename, "parents": [folder_id]}
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        file_id = file.get("id")
+        logger.info("Uploaded message JSON: %s (id=%s)", filename, file_id)
+        return file_id
+    except Exception as e:
+        logger.exception("Drive upload JSON failed: %s", e)
         return None
 
 # -----------------------------
@@ -104,15 +120,23 @@ def format_meta(msg):
     ts = msg.date.astimezone().isoformat()
     return f"[{ts}] msg_id={msg.id} from={msg.sender_id} chat={msg.chat_id}"
 
-def write_log_line(line: str):
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+def build_message_dict(msg, meta: str, text: str, media_entries: list):
+    return {
+        "id": msg.id,
+        "chat_id": msg.chat_id,
+        "sender_id": msg.sender_id,
+        "ts": msg.date.astimezone().isoformat(),
+        "meta": meta,
+        "text": text,
+        "media": media_entries,
+    }
 
-async def safe_download(message, dest_folder: Path, retries: int = 3):
+async def fetch_media_bytes(message, retries: int = 3):
+    """Получить медиа как bytes. Использует download_media(file=bytes)."""
     for attempt in range(1, retries + 1):
         try:
-            path = await message.download_media(file=dest_folder)
-            return Path(path) if path else None
+            data = await message.download_media(file=bytes)  # Telethon вернёт bytes
+            return data if data else None
         except FloodWaitError as e:
             wait = getattr(e, "seconds", 10)
             logger.warning("FloodWaitError: waiting %s seconds", wait)
@@ -140,26 +164,27 @@ async def handler(event):
         meta = format_meta(msg)
         logger.info("New message from target: %s", meta)
         text = msg.message or msg.raw_text or ""
-        write_log_line(meta)
-        if text:
-            write_log_line(text)
-
+        media_entries = []
         if msg.media:
-            saved_path = await safe_download(msg, MEDIA_DIR)
-            if saved_path:
-                write_log_line(f"[Media saved: {saved_path.name}]")
-                logger.info("Media saved locally: %s", saved_path)
-                # upload to drive
-                file_id = upload_file_to_drive(saved_path, DRIVE_FOLDER_ID)
-                if file_id:
-                    write_log_line(f"[Uploaded to Drive: {saved_path.name} (id={file_id})]")
-                else:
-                    write_log_line("[Upload to Drive: FAILED]")
+            media_bytes = await fetch_media_bytes(msg)
+            if media_bytes:
+                filename = f"media_msg{msg.id}_{len(media_bytes)}.bin"
+                file_id = upload_bytes_to_drive(media_bytes, filename, DRIVE_FOLDER_ID)
+                media_entries.append({
+                    "filename": filename,
+                    "drive_file_id": file_id,
+                    "size": len(media_bytes),
+                    "status": "uploaded" if file_id else "failed"
+                })
             else:
-                write_log_line("[Media saved: FAILED]")
-                logger.warning("Couldn't save media for msg_id=%s", msg.id)
+                media_entries.append({"status": "download_failed"})
 
-        write_log_line("")  # separator
+        message_dict = build_message_dict(msg, meta, text, media_entries)
+        json_drive_id = upload_message_json(message_dict, DRIVE_FOLDER_ID)
+        if json_drive_id:
+            logger.info("Message JSON uploaded (drive id=%s) msg_id=%s", json_drive_id, msg.id)
+        else:
+            logger.warning("Failed to upload message JSON msg_id=%s", msg.id)
     except RPCError as e:
         logger.exception("RPCError while handling message: %s", e)
     except Exception as e:
