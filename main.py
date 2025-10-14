@@ -1,4 +1,4 @@
-# main.pyук
+# main.pyукф
 import os
 import json
 import asyncio
