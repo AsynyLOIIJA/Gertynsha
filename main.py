@@ -3,13 +3,11 @@ import os
 import json
 import asyncio
 import logging
-from datetime import datetime
 from pathlib import Path
 from threading import Thread
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
-
 from flask import Flask
 
 # Google API
@@ -17,27 +15,30 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ========== Keep-alive (Flask) ==========
+# -----------------------------
+# Flask keep-alive
+# -----------------------------
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
     return "Telegram listener is alive and syncing to Google Drive."
 
 def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 def keep_alive():
     t = Thread(target=run_flask, daemon=True)
     t.start()
 
-# ========== Config from env ==========
-API_ID = int(os.environ.get("API_ID", "0"))
+# -----------------------------
+# Config from environment
+# -----------------------------
+API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # если используем бота
 TARGET = os.environ.get("TARGET", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "live_session")
-
-# Google service account and folder
 SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON", "")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 
@@ -47,7 +48,9 @@ if not API_ID or not API_HASH or not TARGET:
 if not SERVICE_ACCOUNT_JSON or not DRIVE_FOLDER_ID:
     raise ValueError("SERVICE_ACCOUNT_JSON and DRIVE_FOLDER_ID must be set in environment variables.")
 
-# ========== Logging ==========
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -55,44 +58,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tg-listener")
 
-# ========== Paths ==========
+# -----------------------------
+# Paths
+# -----------------------------
 BASE_DIR = Path("live_dump") / str(TARGET)
 MEDIA_DIR = BASE_DIR / "media"
 LOG_FILE = BASE_DIR / "live_messages.txt"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ========== Telethon client ==========
+# -----------------------------
+# Telethon client
+# -----------------------------
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# ========== Google Drive client (service account) ==========
-SCOPES = ['https://www.googleapis.com/auth/drive']
+# -----------------------------
+# Google Drive client
+# -----------------------------
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 def create_drive_service_from_sa(sa_json_str: str):
     sa_info = json.loads(sa_json_str)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     return drive_service
 
 drive_service = create_drive_service_from_sa(SERVICE_ACCOUNT_JSON)
 
 def upload_file_to_drive(local_path: Path, folder_id: str):
-    """Upload local_path to Drive inside folder_id. Returns file id or None."""
     try:
-        file_metadata = {
-            'name': local_path.name,
-            'parents': [folder_id]
-        }
+        file_metadata = {"name": local_path.name, "parents": [folder_id]}
         media = MediaFileUpload(str(local_path), resumable=True)
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        file_id = file.get('id')
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        file_id = file.get("id")
         logger.info("Uploaded to Drive: %s (id=%s)", local_path.name, file_id)
         return file_id
     except Exception as e:
         logger.exception("Drive upload failed for %s: %s", local_path, e)
         return None
 
-# ========== Helpers ==========
+# -----------------------------
+# Helpers
+# -----------------------------
 def format_meta(msg):
     ts = msg.date.astimezone().isoformat()
     return f"[{ts}] msg_id={msg.id} from={msg.sender_id} chat={msg.chat_id}"
@@ -107,7 +114,7 @@ async def safe_download(message, dest_folder: Path, retries: int = 3):
             path = await message.download_media(file=dest_folder)
             return Path(path) if path else None
         except FloodWaitError as e:
-            wait = getattr(e, 'seconds', 10)
+            wait = getattr(e, "seconds", 10)
             logger.warning("FloodWaitError: waiting %s seconds", wait)
             await asyncio.sleep(wait + 1)
         except Exception as e:
@@ -115,7 +122,9 @@ async def safe_download(message, dest_folder: Path, retries: int = 3):
             await asyncio.sleep(2)
     return None
 
-# ========== Event handler ==========
+# -----------------------------
+# Event handler
+# -----------------------------
 @client.on(events.NewMessage(incoming=True))
 async def handler(event):
     try:
@@ -156,11 +165,18 @@ async def handler(event):
     except Exception as e:
         logger.exception("Error in handler: %s", e)
 
-# ========== Main ==========
+# -----------------------------
+# Main
+# -----------------------------
 async def main():
-    await client.start()
-    me = await client.get_me()
-    logger.info("Authorized as %s (%s)", me.first_name, me.id)
+    if BOT_TOKEN:
+        await client.start(bot_token=BOT_TOKEN)
+        logger.info("Started bot with BOT_TOKEN")
+    else:
+        await client.start()
+        me = await client.get_me()
+        logger.info("Authorized as %s (%s)", me.first_name, me.id)
+
     logger.info("Listening for messages from: %s", TARGET)
     await client.run_until_disconnected()
 
