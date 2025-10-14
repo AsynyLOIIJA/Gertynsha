@@ -3,8 +3,11 @@ import os
 import json
 import asyncio
 import logging
-import mimetypes
 from threading import Thread
+from queue import Queue
+from datetime import datetime
+import re
+import mimetypes
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
@@ -36,16 +39,15 @@ def keep_alive():
 # -----------------------------
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-TARGET = os.environ.get("TARGET", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # если используем бота
 SESSION_NAME = os.environ.get("SESSION_NAME", "live_session")
 TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 
-if not API_ID or not API_HASH or not TARGET:
-    raise ValueError("API_ID, API_HASH and TARGET must be set in environment variables.")
+if not API_ID or not API_HASH:
+    raise ValueError("API_ID and API_HASH must be set.")
 if not TOKEN_FILE or not DRIVE_FOLDER_ID:
-    raise ValueError("TOKEN_FILE and DRIVE_FOLDER_ID must be set in environment variables.")
+    raise ValueError("TOKEN_FILE and DRIVE_FOLDER_ID must be set.")
 
 # -----------------------------
 # Logging
@@ -77,53 +79,61 @@ drive_service = create_drive_service_from_token(TOKEN_FILE)
 # -----------------------------
 # Helpers
 # -----------------------------
-def get_file_extension(mime_type: str):
-    """Определяем расширение по MIME-type. Если не определено — возвращаем bin."""
+def sanitize_filename(name: str, max_len: int = 150) -> str:
+    name = name or "unknown"
+    name = re.sub(r'[^\w\s\-_.()]', '_', name)
+    name = re.sub(r'\s+', '_', name).strip('_')
+    return name[:max_len]
+
+def get_sender_display(sender):
+    if not sender:
+        return "unknown"
+    if getattr(sender, "username", None):
+        return sanitize_filename(str(sender.username))
+    first = getattr(sender, "first_name", "") or ""
+    last = getattr(sender, "last_name", "") or ""
+    full = (first + " " + last).strip()
+    return sanitize_filename(full) if full else f"user_{sender.id}"
+
+def get_original_filename(msg):
+    try:
+        if msg.file and getattr(msg.file, "name", None):
+            return sanitize_filename(msg.file.name)
+        if getattr(msg.media, "document", None):
+            for attr in msg.media.document.attributes:
+                if getattr(attr, "file_name", None):
+                    return sanitize_filename(attr.file_name)
+    except Exception:
+        pass
+    return None
+
+def ts_for_name(dt):
+    return dt.astimezone().isoformat().replace(':', '-')
+
+def get_file_extension(mime_type: str) -> str:
+    if not mime_type:
+        return ".bin"
     ext = mimetypes.guess_extension(mime_type)
     if ext:
         return ext
-    # Специальные случаи Telethon (иногда mime_type пустой)
+    # fallback for common types
     mapping = {
-        "image": ".jpg",
-        "video": ".mp4",
-        "audio": ".mp3",
-        "document": ".pdf",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "video/mp4": ".mp4",
+        "audio/ogg": ".ogg",
+        "audio/mpeg": ".mp3",
+        "application/pdf": ".pdf"
     }
-    for k, v in mapping.items():
-        if k in (mime_type or "").lower():
-            return v
-    return ".bin"
+    return mapping.get(mime_type, ".bin")
 
 def format_meta(msg):
     ts = msg.date.astimezone().isoformat()
     return f"[{ts}] msg_id={msg.id} from={msg.sender_id} chat={msg.chat_id}"
 
-def build_message_dict(msg, meta: str, text: str):
-    return {
-        "id": msg.id,
-        "chat_id": msg.chat_id,
-        "sender_id": msg.sender_id,
-        "ts": msg.date.astimezone().isoformat(),
-        "meta": meta,
-        "text": text
-    }
-
-async def fetch_media_bytes(message, retries: int = 3):
-    for attempt in range(1, retries + 1):
-        try:
-            data = await message.download_media(file=bytes)
-            return data if data else None
-        except FloodWaitError as e:
-            wait = getattr(e, "seconds", 10)
-            logger.warning("FloodWaitError: waiting %s seconds", wait)
-            await asyncio.sleep(wait + 1)
-        except Exception as e:
-            logger.exception("Download attempt %s failed: %s", attempt, e)
-            await asyncio.sleep(2)
-    return None
-
 # -----------------------------
-# Google Drive upload helpers
+# Upload helpers
 # -----------------------------
 def upload_bytes_to_drive(data: bytes, filename: str, folder_id: str):
     try:
@@ -141,7 +151,8 @@ def upload_message_json(message_dict: dict, folder_id: str):
     try:
         json_bytes = json.dumps(message_dict, ensure_ascii=False, indent=2).encode("utf-8")
         ts = message_dict.get('ts', '').replace(':', '-')
-        filename = f"msg_{message_dict.get('id')}_{ts}.json"
+        filename = f"{message_dict.get('sender_name','unknown')}__{ts}.json"
+        filename = sanitize_filename(filename, max_len=200)
         media = MediaInMemoryUpload(json_bytes, mimetype="application/json", resumable=True)
         file_metadata = {"name": filename, "parents": [folder_id]}
         file = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
@@ -152,6 +163,38 @@ def upload_message_json(message_dict: dict, folder_id: str):
         logger.exception("Drive upload JSON failed: %s", e)
         return None
 
+async def fetch_media_bytes(message, retries: int = 3):
+    for attempt in range(1, retries + 1):
+        try:
+            data = await message.download_media(file=bytes)
+            return data if data else None
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", 10)
+            logger.warning("FloodWaitError: waiting %s seconds", wait)
+            await asyncio.sleep(wait + 1)
+        except Exception as e:
+            logger.exception("Download attempt %s failed: %s", attempt, e)
+            await asyncio.sleep(2)
+    return None
+
+# -----------------------------
+# Async Queue for uploads
+# -----------------------------
+upload_queue = asyncio.Queue()
+
+async def upload_worker():
+    while True:
+        task = await upload_queue.get()
+        try:
+            if task["type"] == "media":
+                upload_bytes_to_drive(task["data"], task["filename"], DRIVE_FOLDER_ID)
+            elif task["type"] == "json":
+                upload_message_json(task["data"], DRIVE_FOLDER_ID)
+        except Exception as e:
+            logger.exception("Upload worker error: %s", e)
+        finally:
+            upload_queue.task_done()
+
 # -----------------------------
 # Event handler
 # -----------------------------
@@ -159,33 +202,43 @@ def upload_message_json(message_dict: dict, folder_id: str):
 async def handler(event):
     try:
         msg = event.message
+        if not event.is_private:
+            return
+
         sender = await event.get_sender()
         if not sender:
             return
 
-        is_target = (hasattr(sender, "username") and str(sender.username) == str(TARGET)) or (str(sender.id) == str(TARGET))
-        if not is_target:
-            return
-
+        sender_name = get_sender_display(sender)
         meta = format_meta(msg)
-        logger.info("New message from target: %s", meta)
+        logger.info("New message from %s: %s", sender_name, meta)
+
         text = msg.message or msg.raw_text or ""
-
-        # --- JSON только для текста ---
         if text.strip():
-            message_dict = build_message_dict(msg, meta, text)
-            upload_message_json(message_dict, DRIVE_FOLDER_ID)
+            message_dict = {
+                "id": msg.id,
+                "chat_id": msg.chat_id,
+                "sender_id": msg.sender_id,
+                "sender_name": sender_name,
+                "ts": msg.date.astimezone().isoformat(),
+                "text": text
+            }
+            await upload_queue.put({"type": "json", "data": message_dict})
 
-        # --- Медиа загружаем отдельно ---
         if msg.media:
             media_bytes = await fetch_media_bytes(msg)
             if media_bytes:
-                mime_type = getattr(msg.media, "mime_type", None) or "application/octet-stream"
-                ext = get_file_extension(mime_type)
-                filename = f"media_msg{msg.id}_{len(media_bytes)}{ext}"
-                upload_bytes_to_drive(media_bytes, filename, DRIVE_FOLDER_ID)
+                orig_name = get_original_filename(msg)
+                if orig_name:
+                    filename = f"{sender_name}__{ts_for_name(msg.date)}__{orig_name}"
+                else:
+                    mime_type = getattr(msg.media, "mime_type", None) or "application/octet-stream"
+                    ext = get_file_extension(mime_type)
+                    filename = f"{sender_name}__{ts_for_name(msg.date)}__msg{msg.id}{ext}"
+                filename = sanitize_filename(filename, max_len=200)
+                await upload_queue.put({"type": "media", "data": media_bytes, "filename": filename})
             else:
-                logger.warning("Failed to download media msg_id=%s", msg.id)
+                logger.warning("Failed to download media msg_id=%s from %s", msg.id, sender_name)
 
     except RPCError as e:
         logger.exception("RPCError while handling message: %s", e)
@@ -196,6 +249,10 @@ async def handler(event):
 # Main
 # -----------------------------
 async def main():
+    # старт worker-ов
+    for _ in range(3):
+        asyncio.create_task(upload_worker())
+
     if BOT_TOKEN:
         await client.start(bot_token=BOT_TOKEN)
         logger.info("Started bot with BOT_TOKEN")
@@ -204,7 +261,7 @@ async def main():
         me = await client.get_me()
         logger.info("Authorized as %s (%s)", me.first_name, me.id)
 
-    logger.info("Listening for messages from: %s", TARGET)
+    logger.info("Listening for incoming private messages...")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
