@@ -3,6 +3,7 @@ import os
 import json
 import asyncio
 import logging
+import mimetypes
 from threading import Thread
 
 from telethon import TelegramClient, events
@@ -35,10 +36,10 @@ def keep_alive():
 # -----------------------------
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # если используем бота
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 TARGET = os.environ.get("TARGET", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "live_session")
-TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")  # OAuth token.json
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "token.json")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 
 if not API_ID or not API_HASH or not TARGET:
@@ -74,6 +75,54 @@ def create_drive_service_from_token(token_file=TOKEN_FILE):
 drive_service = create_drive_service_from_token(TOKEN_FILE)
 
 # -----------------------------
+# Helpers
+# -----------------------------
+def get_file_extension(mime_type: str):
+    """Определяем расширение по MIME-type. Если не определено — возвращаем bin."""
+    ext = mimetypes.guess_extension(mime_type)
+    if ext:
+        return ext
+    # Специальные случаи Telethon (иногда mime_type пустой)
+    mapping = {
+        "image": ".jpg",
+        "video": ".mp4",
+        "audio": ".mp3",
+        "document": ".pdf",
+    }
+    for k, v in mapping.items():
+        if k in (mime_type or "").lower():
+            return v
+    return ".bin"
+
+def format_meta(msg):
+    ts = msg.date.astimezone().isoformat()
+    return f"[{ts}] msg_id={msg.id} from={msg.sender_id} chat={msg.chat_id}"
+
+def build_message_dict(msg, meta: str, text: str):
+    return {
+        "id": msg.id,
+        "chat_id": msg.chat_id,
+        "sender_id": msg.sender_id,
+        "ts": msg.date.astimezone().isoformat(),
+        "meta": meta,
+        "text": text
+    }
+
+async def fetch_media_bytes(message, retries: int = 3):
+    for attempt in range(1, retries + 1):
+        try:
+            data = await message.download_media(file=bytes)
+            return data if data else None
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", 10)
+            logger.warning("FloodWaitError: waiting %s seconds", wait)
+            await asyncio.sleep(wait + 1)
+        except Exception as e:
+            logger.exception("Download attempt %s failed: %s", attempt, e)
+            await asyncio.sleep(2)
+    return None
+
+# -----------------------------
 # Google Drive upload helpers
 # -----------------------------
 def upload_bytes_to_drive(data: bytes, filename: str, folder_id: str):
@@ -104,38 +153,6 @@ def upload_message_json(message_dict: dict, folder_id: str):
         return None
 
 # -----------------------------
-# Helpers
-# -----------------------------
-def format_meta(msg):
-    ts = msg.date.astimezone().isoformat()
-    return f"[{ts}] msg_id={msg.id} from={msg.sender_id} chat={msg.chat_id}"
-
-def build_message_dict(msg, meta: str, text: str, media_entries: list):
-    return {
-        "id": msg.id,
-        "chat_id": msg.chat_id,
-        "sender_id": msg.sender_id,
-        "ts": msg.date.astimezone().isoformat(),
-        "meta": meta,
-        "text": text,
-        "media": media_entries,
-    }
-
-async def fetch_media_bytes(message, retries: int = 3):
-    for attempt in range(1, retries + 1):
-        try:
-            data = await message.download_media(file=bytes)
-            return data if data else None
-        except FloodWaitError as e:
-            wait = getattr(e, "seconds", 10)
-            logger.warning("FloodWaitError: waiting %s seconds", wait)
-            await asyncio.sleep(wait + 1)
-        except Exception as e:
-            logger.exception("Download attempt %s failed: %s", attempt, e)
-            await asyncio.sleep(2)
-    return None
-
-# -----------------------------
 # Event handler
 # -----------------------------
 @client.on(events.NewMessage(incoming=True))
@@ -153,28 +170,23 @@ async def handler(event):
         meta = format_meta(msg)
         logger.info("New message from target: %s", meta)
         text = msg.message or msg.raw_text or ""
-        media_entries = []
 
+        # --- JSON только для текста ---
+        if text.strip():
+            message_dict = build_message_dict(msg, meta, text)
+            upload_message_json(message_dict, DRIVE_FOLDER_ID)
+
+        # --- Медиа загружаем отдельно ---
         if msg.media:
             media_bytes = await fetch_media_bytes(msg)
             if media_bytes:
-                filename = f"media_msg{msg.id}_{len(media_bytes)}.bin"
-                file_id = upload_bytes_to_drive(media_bytes, filename, DRIVE_FOLDER_ID)
-                media_entries.append({
-                    "filename": filename,
-                    "drive_file_id": file_id,
-                    "size": len(media_bytes),
-                    "status": "uploaded" if file_id else "failed"
-                })
+                mime_type = getattr(msg.media, "mime_type", None) or "application/octet-stream"
+                ext = get_file_extension(mime_type)
+                filename = f"media_msg{msg.id}_{len(media_bytes)}{ext}"
+                upload_bytes_to_drive(media_bytes, filename, DRIVE_FOLDER_ID)
             else:
-                media_entries.append({"status": "download_failed"})
+                logger.warning("Failed to download media msg_id=%s", msg.id)
 
-        message_dict = build_message_dict(msg, meta, text, media_entries)
-        json_drive_id = upload_message_json(message_dict, DRIVE_FOLDER_ID)
-        if json_drive_id:
-            logger.info("Message JSON uploaded (drive id=%s) msg_id=%s", json_drive_id, msg.id)
-        else:
-            logger.warning("Failed to upload message JSON msg_id=%s", msg.id)
     except RPCError as e:
         logger.exception("RPCError while handling message: %s", e)
     except Exception as e:
