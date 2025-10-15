@@ -347,92 +347,7 @@ async def upload_worker():
             upload_queue.task_done()
 
 # -----------------------------
-# Event handler
-# -----------------------------
-@client.on(events.NewMessage(incoming=True))
-async def handler(event):
-    try:
-        msg = event.message
-        if not event.is_private:
-            return
-
-        sender = await event.get_sender()
-        if not sender:
-            return
-
-        sender_name = get_sender_display(sender)
-        meta = format_meta(msg)
-        logger.info("New message from %s: %s", sender_name, meta)
-
-        text = msg.message or msg.raw_text or ""
-        if text.strip():
-            message_dict = {
-                "id": msg.id,
-                "chat_id": msg.chat_id,
-                "sender_id": msg.sender_id,
-                "sender_name": sender_name,
-                "ts": msg.date.astimezone().isoformat(),
-                "text": text
-            }
-            await upload_queue.put({"type": "json", "data": message_dict})
-
-        if msg.media:
-            media_bytes = await fetch_media_bytes(msg)
-            if media_bytes:
-                filename = build_media_filename(msg, sender_name, media_bytes)
-                await upload_queue.put({"type": "media", "data": media_bytes, "filename": filename})
-                media_filenames = [filename]
-            else:
-                logger.warning("Failed to download media msg_id=%s from %s", msg.id, sender_name)
-                media_filenames = []
-        else:
-            media_filenames = []
-
-        # Сохранить в оперативном буфере для HTML
-        with recent_lock:
-            recent_messages.append({
-                "id": msg.id,
-                "sender": sender_name,
-                "ts": msg.date.astimezone().isoformat(),
-                "text": text.strip(),
-                "media": media_filenames,
-            })
-
-    except RPCError as e:
-        logger.exception("RPCError while handling message: %s", e)
-    except Exception as e:
-        logger.exception("Error in handler: %s", e)
-
-# -----------------------------
-# Main
-# -----------------------------
-async def main():
-    # старт worker-ов
-    for _ in range(3):
-        asyncio.create_task(upload_worker())
-
-    if BOT_TOKEN:
-        await client.start(bot_token=BOT_TOKEN)
-        logger.info("Started bot with BOT_TOKEN")
-    else:
-        await client.start()
-        me = await client.get_me()
-        logger.info("Authorized as %s (%s)", me.first_name, me.id)
-
-    logger.info("Listening for incoming private messages...")
-    await client.run_until_disconnected()
-
-if __name__ == "__main__":
-    keep_alive()
-    start_self_ping()
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Stopped by user")
-
-# -----------------------------
 # Flask routes for HTML / JSON rendering of recent messages
-# (добавлено после блока __main__ чтобы Flask видел глобальные объекты)
 # -----------------------------
 
 @app.route("/messages")
@@ -528,3 +443,87 @@ def messages_json():
                     mm['media_links'].append({"filename": fname, "drive_file_id": fid})
         enriched.append(mm)
     return Response(json.dumps(enriched, ensure_ascii=False, indent=2), mimetype="application/json")
+
+# -----------------------------
+# Event handler
+# -----------------------------
+@client.on(events.NewMessage(incoming=True))
+async def handler(event):
+    try:
+        msg = event.message
+        if not event.is_private:
+            return
+
+        sender = await event.get_sender()
+        if not sender:
+            return
+
+        sender_name = get_sender_display(sender)
+        meta = format_meta(msg)
+        logger.info("New message from %s: %s", sender_name, meta)
+
+        text = msg.message or msg.raw_text or ""
+        if text.strip():
+            message_dict = {
+                "id": msg.id,
+                "chat_id": msg.chat_id,
+                "sender_id": msg.sender_id,
+                "sender_name": sender_name,
+                "ts": msg.date.astimezone().isoformat(),
+                "text": text
+            }
+            await upload_queue.put({"type": "json", "data": message_dict})
+
+        if msg.media:
+            media_bytes = await fetch_media_bytes(msg)
+            if media_bytes:
+                filename = build_media_filename(msg, sender_name, media_bytes)
+                await upload_queue.put({"type": "media", "data": media_bytes, "filename": filename})
+                media_filenames = [filename]
+            else:
+                logger.warning("Failed to download media msg_id=%s from %s", msg.id, sender_name)
+                media_filenames = []
+        else:
+            media_filenames = []
+
+        # Сохранить в оперативном буфере для HTML
+        with recent_lock:
+            recent_messages.append({
+                "id": msg.id,
+                "sender": sender_name,
+                "ts": msg.date.astimezone().isoformat(),
+                "text": text.strip(),
+                "media": media_filenames,
+            })
+
+    except RPCError as e:
+        logger.exception("RPCError while handling message: %s", e)
+    except Exception as e:
+        logger.exception("Error in handler: %s", e)
+
+# -----------------------------
+# Main
+# -----------------------------
+async def main():
+    # старт worker-ов
+    for _ in range(3):
+        asyncio.create_task(upload_worker())
+
+    if BOT_TOKEN:
+        await client.start(bot_token=BOT_TOKEN)
+        logger.info("Started bot with BOT_TOKEN")
+    else:
+        await client.start()
+        me = await client.get_me()
+        logger.info("Authorized as %s (%s)", me.first_name, me.id)
+
+    logger.info("Listening for incoming private messages...")
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    keep_alive()
+    start_self_ping()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
