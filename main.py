@@ -116,6 +116,12 @@ def create_drive_service_from_token(token_file=TOKEN_FILE):
 drive_service = create_drive_service_from_token(TOKEN_FILE)
 
 # -----------------------------
+# Backfill settings (edit if needed)
+# -----------------------------
+# Максимум сообщений на диалог при бэкфилле (None = без лимита)
+BACKFILL_LIMIT_PER_DIALOG = None
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def sanitize_filename(name: str, max_len: int = 150) -> str:
@@ -347,6 +353,101 @@ async def upload_worker():
             upload_queue.task_done()
 
 # -----------------------------
+# Unified message processing
+# -----------------------------
+async def process_incoming_message(msg):
+    try:
+        sender = await msg.get_sender()
+        if not sender:
+            return
+
+        sender_name = get_sender_display(sender)
+        meta = format_meta(msg)
+        logger.info("New message from %s: %s", sender_name, meta)
+
+        text = msg.message or msg.raw_text or ""
+        if text.strip():
+            message_dict = {
+                "id": msg.id,
+                "chat_id": msg.chat_id,
+                "sender_id": msg.sender_id,
+                "sender_name": sender_name,
+                "ts": msg.date.astimezone().isoformat(),
+                "text": text,
+            }
+            await upload_queue.put({"type": "json", "data": message_dict})
+
+        media_filenames = []
+        if msg.media:
+            media_bytes = await fetch_media_bytes(msg)
+            if media_bytes:
+                filename = build_media_filename(msg, sender_name, media_bytes)
+                await upload_queue.put({"type": "media", "data": media_bytes, "filename": filename})
+                media_filenames = [filename]
+            else:
+                logger.warning("Failed to download media msg_id=%s from %s", msg.id, sender_name)
+
+        # Store in HTML buffer
+        with recent_lock:
+            recent_messages.append({
+                "id": msg.id,
+                "sender": sender_name,
+                "ts": msg.date.astimezone().isoformat(),
+                "text": (msg.message or msg.raw_text or "").strip(),
+                "media": media_filenames,
+            })
+
+    except RPCError as e:
+        logger.exception("RPCError while handling message: %s", e)
+    except Exception as e:
+        logger.exception("Error in process_incoming_message: %s", e)
+
+
+# -----------------------------
+# Backfill unread on startup
+# -----------------------------
+async def backfill_unread_private():
+    try:
+        dialogs = await client.get_dialogs(limit=None)
+        total_dialogs = 0
+        total_msgs = 0
+        for d in dialogs:
+            # Интересуют только приватные чаты (пользователи/боты)
+            if not getattr(d, "is_user", False):
+                continue
+            unread = getattr(d, "unread_count", 0) or 0
+            if unread <= 0:
+                continue
+            total_dialogs += 1
+            # raw dialog содержит read_inbox_max_id
+            read_max = 0
+            try:
+                if getattr(d, "dialog", None) and getattr(d.dialog, "read_inbox_max_id", None):
+                    read_max = int(d.dialog.read_inbox_max_id or 0)
+            except Exception:
+                read_max = 0
+
+            logger.info("Backfill dialog %s: unread=%s, read_inbox_max_id=%s", getattr(d.entity, 'username', getattr(d.entity, 'id', 'user')), unread, read_max)
+
+            fetched = 0
+            async for msg in client.iter_messages(d.entity, reverse=True, min_id=read_max):
+                await process_incoming_message(msg)
+                fetched += 1
+                total_msgs += 1
+                if BACKFILL_LIMIT_PER_DIALOG and fetched >= BACKFILL_LIMIT_PER_DIALOG:
+                    break
+                # лёгкая уступка циклу во избежание блокировок
+                await asyncio.sleep(0)
+        if total_dialogs:
+            logger.info("Backfill finished: dialogs=%s, messages=%s", total_dialogs, total_msgs)
+        else:
+            logger.info("Backfill finished: no unread private dialogs")
+    except RPCError as e:
+        logger.exception("RPCError during backfill: %s", e)
+    except Exception as e:
+        logger.exception("Backfill error: %s", e)
+
+# -----------------------------
 # Flask routes for HTML / JSON rendering of recent messages
 # -----------------------------
 
@@ -449,64 +550,24 @@ def messages_json():
 # -----------------------------
 @client.on(events.NewMessage(incoming=True))
 async def handler(event):
-    try:
-        msg = event.message
-        if not event.is_private:
-            return
+    msg = event.message
+    if not event.is_private:
+        return
+    await process_incoming_message(msg)
 
-        sender = await event.get_sender()
-        if not sender:
-            return
-
-        sender_name = get_sender_display(sender)
-        meta = format_meta(msg)
-        logger.info("New message from %s: %s", sender_name, meta)
-
-        text = msg.message or msg.raw_text or ""
-        if text.strip():
-            message_dict = {
-                "id": msg.id,
-                "chat_id": msg.chat_id,
-                "sender_id": msg.sender_id,
-                "sender_name": sender_name,
-                "ts": msg.date.astimezone().isoformat(),
-                "text": text
-            }
-            await upload_queue.put({"type": "json", "data": message_dict})
-
-        if msg.media:
-            media_bytes = await fetch_media_bytes(msg)
-            if media_bytes:
-                filename = build_media_filename(msg, sender_name, media_bytes)
-                await upload_queue.put({"type": "media", "data": media_bytes, "filename": filename})
-                media_filenames = [filename]
-            else:
-                logger.warning("Failed to download media msg_id=%s from %s", msg.id, sender_name)
-                media_filenames = []
-        else:
-            media_filenames = []
-
-        # Сохранить в оперативном буфере для HTML
-        with recent_lock:
-            recent_messages.append({
-                "id": msg.id,
-                "sender": sender_name,
-                "ts": msg.date.astimezone().isoformat(),
-                "text": text.strip(),
-                "media": media_filenames,
-            })
-
-    except RPCError as e:
-        logger.exception("RPCError while handling message: %s", e)
-    except Exception as e:
-        logger.exception("Error in handler: %s", e)
+@client.on(events.NewMessage(outgoing=True))
+async def handler_out(event):
+    msg = event.message
+    if not event.is_private:
+        return
+    await process_incoming_message(msg)
 
 # -----------------------------
 # Main
 # -----------------------------
 async def main():
     # старт worker-ов
-    for _ in range(3):
+    for _ in range(1):  # единичный воркер сохраняет порядок загрузок
         asyncio.create_task(upload_worker())
 
     if BOT_TOKEN:
@@ -516,6 +577,9 @@ async def main():
         await client.start()
         me = await client.get_me()
         logger.info("Authorized as %s (%s)", me.first_name, me.id)
+
+    # Бэкфилл непрочитанных приватных сообщений
+    await backfill_unread_private()
 
     logger.info("Listening for incoming private messages...")
     await client.run_until_disconnected()
