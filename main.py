@@ -40,7 +40,10 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Telegram listener is alive and syncing to Google Drive."
+    return (
+        "Telegram listener is alive and syncing to Google Drive. "
+        "<a href='/chats'>Open chats</a> | <a href='/messages'>Old view</a>"
+    )
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
@@ -120,6 +123,22 @@ drive_service = create_drive_service_from_token(TOKEN_FILE)
 # -----------------------------
 # Максимум сообщений на диалог при бэкфилле (None = без лимита)
 BACKFILL_LIMIT_PER_DIALOG = None
+
+# -----------------------------
+# Filtering settings (edit if needed)
+# -----------------------------
+# Игнорировать все бот-аккаунты по умолчанию
+IGNORE_ALL_BOTS = True
+# Разрешённые боты по username (нижний регистр), имеют приоритет над игнором
+ALLOWED_BOT_USERNAMES = {  # примеры: "botfather", "my_useful_bot"
+    # "botfather",
+}
+# Стоп-лист по username (нижний регистр)
+BLOCKED_USERNAMES = {
+    # "friendtaskbot",
+}
+# Стоп-лист по числовым ID пользователей
+BLOCKED_USER_IDS = set()
 
 # -----------------------------
 # Helpers
@@ -360,8 +379,22 @@ async def process_incoming_message(msg):
         sender = await msg.get_sender()
         if not sender:
             return
+        # Собеседник (в приватном чате это вторая сторона диалога)
+        try:
+            peer = await client.get_entity(msg.peer_id)
+        except Exception:
+            peer = None
+
+        # Фильтрация: если собеседник в стоп-листе или является ботом (и не в allowlist) — пропускаем
+        if peer and should_skip_entity(peer):
+            uname = getattr(peer, 'username', None) or getattr(peer, 'id', 'unknown')
+            logger.info("Skip message due to filter: peer=%s", uname)
+            return
 
         sender_name = get_sender_display(sender)
+        peer_id = getattr(peer, 'id', None)
+        peer_name = get_sender_display(peer) if peer else "unknown"
+        is_out = bool(getattr(msg, 'out', False))
         meta = format_meta(msg)
         logger.info("New message from %s: %s", sender_name, meta)
 
@@ -372,6 +405,9 @@ async def process_incoming_message(msg):
                 "chat_id": msg.chat_id,
                 "sender_id": msg.sender_id,
                 "sender_name": sender_name,
+                "peer_id": peer_id,
+                "peer_name": peer_name,
+                "out": is_out,
                 "ts": msg.date.astimezone().isoformat(),
                 "text": text,
             }
@@ -391,7 +427,10 @@ async def process_incoming_message(msg):
         with recent_lock:
             recent_messages.append({
                 "id": msg.id,
+                "peer_id": peer_id,
+                "peer": peer_name,
                 "sender": sender_name,
+                "out": is_out,
                 "ts": msg.date.astimezone().isoformat(),
                 "text": (msg.message or msg.raw_text or "").strip(),
                 "media": media_filenames,
@@ -414,6 +453,9 @@ async def backfill_unread_private():
         for d in dialogs:
             # Интересуют только приватные чаты (пользователи/боты)
             if not getattr(d, "is_user", False):
+                continue
+            # Фильтрация по собеседнику
+            if d.entity and should_skip_entity(d.entity):
                 continue
             unread = getattr(d, "unread_count", 0) or 0
             if unread <= 0:
@@ -448,9 +490,147 @@ async def backfill_unread_private():
         logger.exception("Backfill error: %s", e)
 
 # -----------------------------
+# Filtering helpers
+# -----------------------------
+def _uname(obj) -> str | None:
+    u = getattr(obj, 'username', None)
+    return u.lower() if isinstance(u, str) else None
+
+def should_skip_entity(entity) -> bool:
+    """Возвращает True, если собеседника нужно игнорировать."""
+    try:
+        uid = getattr(entity, 'id', None)
+        uname = _uname(entity)
+        is_bot = bool(getattr(entity, 'bot', False))
+
+        if uid is not None and uid in BLOCKED_USER_IDS:
+            return True
+        if uname and uname in BLOCKED_USERNAMES:
+            return True
+
+        if is_bot:
+            # Разрешённые боты имеют приоритет
+            if uname and uname in ALLOWED_BOT_USERNAMES:
+                return False
+            # Иначе игнорируем, если включён общий игнор ботов
+            if IGNORE_ALL_BOTS:
+                return True
+        return False
+    except Exception:
+        return False
+
+# -----------------------------
 # Flask routes for HTML / JSON rendering of recent messages
 # -----------------------------
 
+@app.route("/chats")
+def chats_index():
+    """Список личных чатов: имя + количество и ссылка."""
+    with recent_lock:
+        data = list(recent_messages)
+    chats = {}
+    for m in data:
+        pid = m.get("peer_id")
+        if pid is None:
+            continue
+        item = chats.get(pid)
+        if not item:
+            chats[pid] = {
+                "name": m.get("peer") or str(pid),
+                "count": 1,
+                "last_ts": m.get("ts"),
+            }
+        else:
+            item["count"] += 1
+            if m.get("ts") and (not item["last_ts"] or m["ts"] > item["last_ts"]):
+                item["last_ts"] = m["ts"]
+    # сортировка по последней активности
+    sorted_items = sorted(chats.items(), key=lambda kv: kv[1]["last_ts"] or "", reverse=True)
+    parts = ["<html><head><meta charset='utf-8'>",
+             "<title>Private Chats</title>",
+             "<style>body{font-family:Arial, sans-serif; background:#fafafa; margin:20px;}\n",
+             "a{color:#0645ad;text-decoration:none;} a:hover{text-decoration:underline;}\n",
+             "li{margin:6px 0;}\n",
+             "</style></head><body>"]
+    parts.append("<h1>Private chats</h1>")
+    parts.append("<ul>")
+    for pid, info in sorted_items:
+        name = (info["name"] or str(pid)).replace("<", "&lt;").replace(">", "&gt;")
+        parts.append(f"<li><a href='/chat?peer={pid}'>{name}</a> "
+                     f"<span style='color:#888'>(messages: {info['count']})</span></li>")
+    parts.append("</ul>")
+    parts.append("<p><a href='/messages'>Old grouped view</a></p>")
+    parts.append("</body></html>")
+    return Response("".join(parts), mimetype="text/html")
+
+@app.route("/chat")
+def chat_view():
+    """Страница переписки с выбранным пользователем (peer)."""
+    peer_q = request.args.get("peer")
+    if not peer_q:
+        return Response("Missing peer param", status=400)
+    try:
+        peer_id = int(peer_q)
+    except ValueError:
+        return Response("Invalid peer", status=400)
+
+    limit = request.args.get("limit")
+    try:
+        limit = int(limit) if limit else None
+    except ValueError:
+        limit = None
+
+    with recent_lock:
+        data = [m for m in list(recent_messages) if m.get("peer_id") == peer_id]
+
+    # сортировка по времени по возрастанию
+    data.sort(key=lambda m: m.get("ts") or "")
+    if limit:
+        data = data[-limit:]
+
+    with media_ids_lock:
+        media_ids_snapshot = dict(media_file_ids)
+
+    peer_name = data[0]["peer"] if data else str(peer_id)
+    parts = ["<html><head><meta charset='utf-8'>",
+             f"<title>Chat with {peer_name}</title>",
+             "<style>body{font-family:Arial, sans-serif; background:#f5f5f5; margin:0;}\n",
+             ".wrap{max-width:800px;margin:0 auto;padding:20px;}\n",
+             ".msg{background:#fff;border:1px solid #ddd;border-radius:12px;padding:10px;",
+             "margin:8px 0; max-width:70%;}\n",
+             ".left{float:left;clear:both;} .right{float:right;clear:both;background:#e7f3ff;}\n",
+             ".meta{color:#777;font-size:12px;margin-bottom:6px;}\n",
+             ".text{white-space:pre-wrap;}\n",
+             ".media a{margin-right:8px;font-size:12px;}\n",
+             ".hdr a{color:#0645ad;text-decoration:none;} .hdr a:hover{text-decoration:underline;}\n",
+             "</style></head><body><div class='wrap'>"]
+    parts.append("<div class='hdr'><a href='/chats'>&larr; All chats</a></div>")
+    parts.append(f"<h2>Chat with {peer_name}</h2>")
+
+    for m in data:
+        side = "right" if m.get("out") else "left"
+        parts.append(f"<div class='msg {side}'>")
+        parts.append(f"<div class='meta'>id={m['id']} | ts={m['ts']}</div>")
+        if m.get('text'):
+            safe_text = (m['text']
+                         .replace('&', '&amp;')
+                         .replace('<', '&lt;')
+                         .replace('>', '&gt;'))
+            parts.append(f"<div class='text'>{safe_text}</div>")
+        if m.get('media'):
+            links = []
+            for fname in m['media']:
+                fid = media_ids_snapshot.get(fname)
+                if fid:
+                    url = f"https://drive.google.com/file/d/{fid}/view?usp=drivesdk"
+                    links.append(f"<a href='{url}' target='_blank'>{fname}</a>")
+                else:
+                    links.append(f"<span>{fname} (uploading...)</span>")
+            parts.append("<div class='media'>" + " ".join(links) + "</div>")
+        parts.append("</div>")
+
+    parts.append("</div></body></html>")
+    return Response("".join(parts), mimetype="text/html")
 @app.route("/messages")
 def messages_html():
     """Вернуть HTML страницу с сообщениями, сгруппированными по пользователю.
