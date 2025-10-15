@@ -1,14 +1,18 @@
-# main.pyxz
+# main.py
 import os
 import json
 import asyncio
 import logging
+import time
+import threading
 from threading import Thread
 from queue import Queue
 from datetime import datetime
 import re
 import mimetypes
 from pathlib import Path
+from collections import deque
+from threading import Lock
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
@@ -21,11 +25,13 @@ from telethon.tl.types import (
     DocumentAttributeSticker,
 )
 from flask import Flask
+from flask import request, Response
 
 # Google API
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
 from google.oauth2.credentials import Credentials
+import requests
 
 # -----------------------------
 # Flask keep-alive
@@ -42,6 +48,30 @@ def run_flask():
 def keep_alive():
     t = Thread(target=run_flask, daemon=True)
     t.start()
+
+# -----------------------------
+# Self-ping (Render keep-alive)
+# -----------------------------
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+KEEPALIVE_INTERVAL_SEC = int(os.environ.get("KEEPALIVE_INTERVAL_SEC", "60"))
+
+def _self_ping_loop():
+    if not PUBLIC_URL:
+        logging.info("No PUBLIC_URL/RENDER_EXTERNAL_URL set; self-ping disabled.")
+        return
+    logging.info("Self-ping enabled: %s (interval=%ss)", PUBLIC_URL, KEEPALIVE_INTERVAL_SEC)
+    session = requests.Session()
+    while True:
+        try:
+            resp = session.get(PUBLIC_URL, timeout=10)
+            logging.debug("Self-ping %s -> %s", PUBLIC_URL, resp.status_code)
+        except Exception as e:
+            logging.warning("Self-ping error: %s", e)
+        time.sleep(KEEPALIVE_INTERVAL_SEC)
+
+def start_self_ping():
+    th = threading.Thread(target=_self_ping_loop, daemon=True)
+    th.start()
 
 # -----------------------------
 # Config from environment
@@ -291,12 +321,24 @@ async def fetch_media_bytes(message, retries: int = 3):
 # -----------------------------
 upload_queue = asyncio.Queue()
 
+# -----------------------------
+# In-memory recent messages storage for HTML rendering
+# -----------------------------
+RECENT_MAX = int(os.environ.get("RECENT_MAX", 2000))
+recent_messages = deque(maxlen=RECENT_MAX)
+recent_lock = Lock()
+media_file_ids = {}  # filename -> drive file id
+media_ids_lock = Lock()
+
 async def upload_worker():
     while True:
         task = await upload_queue.get()
         try:
             if task["type"] == "media":
-                upload_bytes_to_drive(task["data"], task["filename"], DRIVE_FOLDER_ID)
+                file_id = upload_bytes_to_drive(task["data"], task["filename"], DRIVE_FOLDER_ID)
+                if file_id:
+                    with media_ids_lock:
+                        media_file_ids[task["filename"]] = file_id
             elif task["type"] == "json":
                 upload_message_json(task["data"], DRIVE_FOLDER_ID)
         except Exception as e:
@@ -339,8 +381,22 @@ async def handler(event):
             if media_bytes:
                 filename = build_media_filename(msg, sender_name, media_bytes)
                 await upload_queue.put({"type": "media", "data": media_bytes, "filename": filename})
+                media_filenames = [filename]
             else:
                 logger.warning("Failed to download media msg_id=%s from %s", msg.id, sender_name)
+                media_filenames = []
+        else:
+            media_filenames = []
+
+        # Сохранить в оперативном буфере для HTML
+        with recent_lock:
+            recent_messages.append({
+                "id": msg.id,
+                "sender": sender_name,
+                "ts": msg.date.astimezone().isoformat(),
+                "text": text.strip(),
+                "media": media_filenames,
+            })
 
     except RPCError as e:
         logger.exception("RPCError while handling message: %s", e)
@@ -368,8 +424,107 @@ async def main():
 
 if __name__ == "__main__":
     keep_alive()
+    start_self_ping()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Stopped by user")
 
+# -----------------------------
+# Flask routes for HTML / JSON rendering of recent messages
+# (добавлено после блока __main__ чтобы Flask видел глобальные объекты)
+# -----------------------------
+
+@app.route("/messages")
+def messages_html():
+    """Вернуть HTML страницу с сообщениями, сгруппированными по пользователю.
+    Параметры query:
+      limit (int) - максимум сообщений (по умолчанию 200)
+      sender (str) - фильтр по имени отправителя
+    """
+    try:
+        limit = int(request.args.get("limit", 200))
+    except ValueError:
+        limit = 200
+    sender_filter = request.args.get("sender")
+    with recent_lock:
+        data = list(recent_messages)[-limit:]
+    if sender_filter:
+        data = [m for m in data if m["sender"].lower() == sender_filter.lower()]
+    # Группировка по sender с сохранением порядка появления
+    grouped = []  # list of (sender, [messages])
+    index = {}
+    for m in data:
+        s = m["sender"]
+        if s not in index:
+            index[s] = len(grouped)
+            grouped.append((s, [m]))
+        else:
+            grouped[index[s]][1].append(m)
+
+    # Построить HTML
+    parts = ["<html><head><meta charset='utf-8'>",
+             "<title>Recent Telegram Messages</title>",
+             "<style>body{font-family:Arial, sans-serif; background:#fafafa; margin:20px;}\n",
+             "h2{border-bottom:1px solid #ccc; padding-bottom:4px;}\n",
+             ".msg{background:#fff;border:1px solid #ddd;border-radius:6px;padding:8px;margin:6px 0;}\n",
+             ".meta{color:#555;font-size:12px;margin-bottom:4px;}\n",
+             ".media a{margin-right:8px;font-size:12px;}\n",
+             "</style></head><body>"]
+    parts.append(f"<h1>Messages (last {len(data)})</h1>")
+    parts.append("<p>Generated at: " + datetime.utcnow().isoformat() + "Z</p>")
+    if sender_filter:
+        parts.append(f"<p>Filter sender = {sender_filter}</p>")
+    with media_ids_lock:
+        media_ids_snapshot = dict(media_file_ids)
+    for sender, msgs in grouped:
+        parts.append(f"<h2>{sender} <span style='font-size:12px;color:#888'>({len(msgs)})</span></h2>")
+        for m in msgs:
+            parts.append("<div class='msg'>")
+            parts.append(f"<div class='meta'>id={m['id']} | ts={m['ts']}</div>")
+            if m['text']:
+                safe_text = (m['text']
+                             .replace('&', '&amp;')
+                             .replace('<', '&lt;')
+                             .replace('>', '&gt;'))
+                parts.append(f"<div class='text'>{safe_text}</div>")
+            if m['media']:
+                links = []
+                for fname in m['media']:
+                    fid = media_ids_snapshot.get(fname)
+                    if fid:
+                        url = f"https://drive.google.com/file/d/{fid}/view?usp=drivesdk"
+                        links.append(f"<a href='{url}' target='_blank'>{fname}</a>")
+                    else:
+                        links.append(f"<span>{fname} (uploading...)</span>")
+                parts.append("<div class='media'>" + " ".join(links) + "</div>")
+            parts.append("</div>")
+    parts.append("</body></html>")
+    html = "".join(parts)
+    return Response(html, mimetype="text/html")
+
+@app.route("/messages.json")
+def messages_json():
+    try:
+        limit = int(request.args.get("limit", 200))
+    except ValueError:
+        limit = 200
+    sender_filter = request.args.get("sender")
+    with recent_lock:
+        data = list(recent_messages)[-limit:]
+    if sender_filter:
+        data = [m for m in data if m["sender"].lower() == sender_filter.lower()]
+    # Добавляем drive_file_ids если уже есть
+    with media_ids_lock:
+        media_ids_snapshot = dict(media_file_ids)
+    enriched = []
+    for m in data:
+        mm = dict(m)
+        if m['media']:
+            mm['media_links'] = []
+            for fname in m['media']:
+                fid = media_ids_snapshot.get(fname)
+                if fid:
+                    mm['media_links'].append({"filename": fname, "drive_file_id": fid})
+        enriched.append(mm)
+    return Response(json.dumps(enriched, ensure_ascii=False, indent=2), mimetype="application/json")
